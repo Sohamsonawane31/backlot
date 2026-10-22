@@ -1505,7 +1505,7 @@
         "message.subtype": {
           "kind": "missing_field",
           "severity": "gap",
-          "note": "A message posted through the Web API carries no subtype: measured against slack.com on 2026-10-22, a bot-token post echoed `app_id`, `blocks`, `bot_id`, `bot_profile`, `team`, `text`, `ts`, `type` and `user` and no `subtype`, and a user-token post the same without the bot fields. Backlot serves `subtype` on a corpus message that states one, which the probe corpus does through a `channel_join`; this entry is the echo of a post, where there is none to serve."
+          "note": "A message posted through the Web API carries no subtype: measured against slack.com on 2026-10-22, a bot-token post echoed `app_id`, `blocks`, `bot_id`, `bot_profile`, `team`, `text`, `ts`, `type` and `user` and no `subtype`, and a user-token post echoed the same nine fields -- `bot_id` and `bot_profile` included, since the app is what posted it either way. Backlot serves `subtype` on a corpus message that states one, which the probe corpus does through a `channel_join`; this entry is the echo of a post, where there is none to serve."
         },
         "message.team": {
           "kind": "extra_field",
@@ -2906,7 +2906,7 @@
         "items[].message.subtype": {
           "kind": "missing_field",
           "severity": "gap",
-          "note": "A message posted through the Web API carries no subtype: measured against slack.com on 2026-10-22, a bot-token post echoed `app_id`, `blocks`, `bot_id`, `bot_profile`, `team`, `text`, `ts`, `type` and `user` and no `subtype`, and a user-token post the same without the bot fields. Backlot serves `subtype` on a corpus message that states one, which the probe corpus does through a `channel_join`; this entry is the echo of a post, where there is none to serve."
+          "note": "A message posted through the Web API carries no subtype: measured against slack.com on 2026-10-22, a bot-token post echoed `app_id`, `blocks`, `bot_id`, `bot_profile`, `team`, `text`, `ts`, `type` and `user` and no `subtype`, and a user-token post echoed the same nine fields -- `bot_id` and `bot_profile` included, since the app is what posted it either way. Backlot serves `subtype` on a corpus message that states one, which the probe corpus does through a `channel_join`; this entry is the echo of a post, where there is none to serve."
         },
         "items[].message.team": {
           "kind": "extra_field",
