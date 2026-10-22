@@ -4512,6 +4512,37 @@ def test_a_deleted_thread_root_leaves_the_placeholder_real_leaves(wclient, token
     assert root not in history()
 
 
+def test_a_root_keeps_its_thread_while_a_reply_remains(wclient, tokens):
+    # The other side of `_unthread_a_spent_root`: deleting one of two replies leaves the root a
+    # thread root. Without its guard the first delete unthreads it.
+    h = _uh(tokens, "ava@acme.com")
+    cid = synth.slack_channel_id("incidents")
+    root = wclient.post(
+        "/slack/api/chat.postMessage", headers=h, data={"channel": cid, "text": "two replies"}
+    ).json()["ts"]
+    first, second = (
+        wclient.post(
+            "/slack/api/chat.postMessage",
+            headers=h,
+            data={"channel": cid, "text": text, "thread_ts": root},
+        ).json()["ts"]
+        for text in ("one", "two")
+    )
+    wclient.post("/slack/api/chat.delete", headers=h, data={"channel": cid, "ts": first})
+    still = [
+        m
+        for m in wclient.post(
+            "/slack/api/conversations.history", headers=h, data={"channel": cid, "limit": 200}
+        ).json()["messages"]
+        if m["ts"] == root
+    ][0]
+    assert still["thread_ts"] == root
+    thread = wclient.post(
+        "/slack/api/conversations.replies", headers=h, data={"channel": cid, "ts": root}
+    ).json()["messages"]
+    assert [m["ts"] for m in thread] == [root, second]
+
+
 def test_a_root_whose_last_reply_goes_is_a_standalone_message_again(wclient, tokens):
     # Measured with the placeholder above: real leaves no `thread_ts` on it and its permalink
     # loses the thread query.
@@ -4549,7 +4580,7 @@ _DECLARED = {
     "chat.update": {"channel", "ts", "text"},
     "chat.delete": {"channel", "ts"},
     "chat.getPermalink": {"channel", "message_ts"},
-    "reactions.add": {"channel", "timestamp", "name"},
+    "reactions.add": {"channel", "timestamp", "name"},  # all three required; see _P_REACTION_ADD
     "reactions.remove": {"channel", "timestamp", "name"},
     "reactions.get": {"channel", "timestamp"},
     "reactions.list": {"count", "page", "limit", "cursor", "user"},
@@ -4570,6 +4601,144 @@ def test_each_write_method_declares_the_arguments_it_reads(client, method):
         if q.get("in") == "query"
     }
     assert names == _DECLARED[method], method
+
+
+def test_a_json_token_is_not_a_credential(wclient, tokens):
+    # `_json_args` records the measurement. Dropping the `k != "token"` guard left the suite
+    # green, and with it a client is authenticated as whoever a stale field in its payload names.
+    cid = synth.slack_channel_id("incidents")
+    ava, bob = tokens["ava@acme.com"], tokens["bob@acme.com"]
+    body = {"token": ava, "channel": cid, "text": "whose message?"}
+    # With no header at all, a JSON `token` does not authenticate. (A JSON body with no charset
+    # draws `missing_charset` beside the answer, which is its own measurement.)
+    assert (
+        wclient.post(
+            "/slack/api/chat.postMessage", headers={"Content-Type": "application/json"}, json=body
+        ).json()["error"]
+        == "not_authed"
+    )
+    # Beside a header, the header is who posts.
+    posted = wclient.post(
+        "/slack/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {bob}", "Content-Type": "application/json"},
+        json=body,
+    ).json()
+    assert posted["message"]["user"] == synth.slack_user_id("bob@acme.com")
+
+
+@pytest.mark.parametrize(
+    "sent, want",
+    [
+        ({}, "no_text"),
+        ({"blocks": "[]"}, "no_text"),
+        ({"attachments": "[]"}, "no_text"),
+        ({"attachments": "[{}]"}, "no_text"),
+        ({"attachments": "abc"}, "no_text"),
+        ({"blocks": '[{"type": "section"}]'}, None),
+        ({"blocks": "abc"}, "invalid_blocks_format"),
+        ({"blocks": "{}"}, "invalid_blocks_format"),
+        ({"blocks": ""}, "invalid_blocks_format"),
+        ({"text": "x", "blocks": "abc"}, "invalid_blocks_format"),
+    ],
+)
+@pytest.mark.parametrize("method", ["chat.postMessage", "chat.update"])
+def test_blocks_is_read_as_a_value_not_looked_for(wclient, tokens, method, sent, want):
+    # `chat_post_message` records the measurement: only a non-empty `blocks` array stands in for
+    # `text`, `attachments` never does, and a `blocks` that is not an array is refused even
+    # beside a `text`. Dropping the operand from the `no_text` test left the suite green.
+    h = _uh(tokens, "ava@acme.com")
+    cid = synth.slack_channel_id("incidents")
+    ts = wclient.post(
+        "/slack/api/chat.postMessage", headers=h, data={"channel": cid, "text": "editable"}
+    ).json()["ts"]
+    args = {"channel": cid, **sent} | ({"ts": ts} if method == "chat.update" else {})
+    answered = wclient.post(f"/slack/api/{method}", headers=h, data=args).json()
+    if want is None:
+        assert answered["ok"] is True, (method, sent)
+    else:
+        assert answered == {"ok": False, "error": want}, (method, sent)
+
+
+def test_post_ephemeral_reads_the_shape_of_user_then_its_membership(wclient, tokens):
+    # `chat_post_ephemeral` records the measurement. Every mutation of this check survived.
+    h = _uh(tokens, "ava@acme.com")
+    cid = synth.slack_channel_id("incidents")
+    pattern = "[ERROR] input must match regex pattern: ^[UW][A-Z0-9]{2,}$ [json-pointer:/user]"
+    for bad in ("", synth.slack_user_id("ava@acme.com").lower()):
+        assert wclient.post(
+            "/slack/api/chat.postEphemeral", headers=h, data={"channel": cid, "user": bad}
+        ).json() == {
+            "ok": False,
+            "error": "invalid_arguments",
+            "response_metadata": {"messages": [pattern]},
+        }, bad
+    # A missing `user` is named before a missing `channel`.
+    assert wclient.post("/slack/api/chat.postEphemeral", headers=h, data={}).json()[
+        "response_metadata"
+    ]["messages"] == [
+        "[ERROR] missing required field: user",
+        "[ERROR] missing required field: channel",
+    ]
+    # A private channel's members are its grantees, so one who is not in it is refused.
+    private = synth.slack_channel_id("people-confidential")
+    insider = _uh(tokens, "hana@acme.com")
+    assert wclient.post(
+        "/slack/api/chat.postEphemeral",
+        headers=insider,
+        data={"channel": private, "user": synth.slack_user_id("bob@acme.com")},
+    ).json() == {"ok": False, "error": "user_not_in_channel"}
+    # And a member of it is served.
+    assert (
+        wclient.post(
+            "/slack/api/chat.postEphemeral",
+            headers=insider,
+            data={"channel": private, "user": synth.slack_user_id("hana@acme.com")},
+        ).json()["ok"]
+        is True
+    )
+
+
+def test_reactions_list_reads_an_empty_user_and_lists_each_message_once(wclient, tokens):
+    # Two survivors: `user=` read as absent, and the `seen` guard, without which a message the
+    # caller reacted to through the API is listed twice — once from the patch and once from the
+    # merged source.
+    h = _uh(tokens, "ava@acme.com")
+    cid = synth.slack_channel_id("incidents")
+    assert wclient.post("/slack/api/reactions.list", headers=h, data={"user": ""}).json() == {
+        "ok": False,
+        "error": "user_not_found",
+    }
+    ts = wclient.post(
+        "/slack/api/chat.postMessage", headers=h, data={"channel": cid, "text": "once only"}
+    ).json()["ts"]
+    wclient.post(
+        "/slack/api/reactions.add",
+        headers=h,
+        data={"channel": cid, "timestamp": ts, "name": "eyes"},
+    )
+    listed = [
+        i["message"]["ts"]
+        for i in wclient.post("/slack/api/reactions.list", headers=h, data={"limit": "200"}).json()[
+            "items"
+        ]
+    ]
+    assert listed.count(ts) == 1, listed
+
+
+def test_a_quoted_query_scores_a_written_message_against_the_corpus(wclient, tokens):
+    # Every mutation of the phrase scoring survived, because nothing scored a quoted query with
+    # an overlay hit. `_corpus_stats` records what the phrase path does and does not reproduce.
+    h = _uh(tokens, "ava@acme.com")
+    cid = synth.slack_channel_id("incidents")
+    ts = wclient.post(
+        "/slack/api/chat.postMessage",
+        headers=h,
+        data={"channel": cid, "text": "gateway throwing zarquonphrase"},
+    ).json()["ts"]
+    hits = wclient.post(
+        "/slack/api/search.messages", headers=h, data={"query": '"throwing zarquonphrase"'}
+    ).json()["messages"]["matches"]
+    assert ts in [m["ts"] for m in hits]
 
 
 def test_a_permalink_names_the_thread_only_for_a_message_in_one(wclient, tokens):
@@ -4692,11 +4861,14 @@ def test_a_written_message_is_in_a_search_under_either_sort_and_an_in_filter(wcl
 #: still green.
 _WRITE_METHODS = {
     "chat.postMessage": ({"channel": "CID", "text": "x"}, ["channel"]),
-    "chat.postEphemeral": ({"channel": "CID", "user": "UID", "text": "x"}, ["channel", "user"]),
+    "chat.postEphemeral": ({"channel": "CID", "user": "UID", "text": "x"}, ["user", "channel"]),
     "chat.update": ({"channel": "CID", "ts": "TS", "text": "x"}, ["channel", "ts"]),
     "chat.delete": ({"channel": "CID", "ts": "TS"}, ["channel", "ts"]),
     "chat.getPermalink": ({"channel": "CID", "message_ts": "TS"}, ["channel", "message_ts"]),
-    "reactions.add": ({"channel": "CID", "timestamp": "TS", "name": "eyes"}, ["name"]),
+    "reactions.add": (
+        {"channel": "CID", "timestamp": "TS", "name": "eyes"},
+        ["name", "timestamp", "channel"],
+    ),
     "reactions.remove": ({"channel": "CID", "timestamp": "TS", "name": "eyes"}, ["name"]),
     "reactions.get": ({"channel": "CID", "timestamp": "TS"}, []),
     "reactions.list": ({}, []),
@@ -4756,7 +4928,9 @@ def test_every_write_method_hides_a_channel_the_caller_cannot_see(wclient, token
         k: {
             "CID": synth.slack_channel_id("people-confidential"),
             "TS": "1.000001",
-            "UID": "U0",
+            # Well-formed, so the channel check is what refuses: `chat.postEphemeral` reads
+            # the SHAPE of `user` first (`_SLACK_USER_ID`).
+            "UID": synth.slack_user_id("ava@acme.com"),
         }.get(v, v)
         for k, v in args.items()
     }

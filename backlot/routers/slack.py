@@ -126,6 +126,9 @@ TEAM_ID = "T0000BKLT"
 SERVICE_EMAIL = "service-account"
 SERVICE_USER_ID = "USERVICE0"
 BOT_ID = "B0000BKLT"
+#: The shape real requires of a `user` argument, quoted from the refusal it answers for one that
+#: does not match (measured 2026-10-22 on `chat.postEphemeral`).
+_SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
 #: Slackbot, who the placeholder a deleted thread root leaves is attributed to.
 SLACKBOT_ID = "USLACKBOT"
 #: What real leaves in place of a deleted thread root (measured, see `chat_delete`).
@@ -2168,31 +2171,59 @@ async def chat_post_ephemeral(request: Request):
     Backlot answers `channel_not_found` and `user_not_in_channel`.
 
     `text` is not required here, where `chat.postMessage` requires it: measured against
-    slack.com on 2026-10-22, this method posts with `text` absent, empty or blank, and refuses
-    only a missing `user` (`invalid_arguments`) or one who is not in the channel
-    (`user_not_in_channel`). Reading `text` by `chat.postMessage`'s rule is the mistake
-    :data:`_P_POST_EPHEMERAL` cannot catch, since the two methods share nothing but a name.
+    slack.com on 2026-10-22, this method posts with `text` absent, empty or blank. Reading
+    `text` by `chat.postMessage`'s rule is the mistake a shared name invites.
+
+    `user` is read in two steps, both measured the same day. Its SHAPE first: a value that does
+    not match ``^[UW][A-Z0-9]{2,}$`` — an empty one, a lower-cased id — is `invalid_arguments`
+    carrying that pattern, ahead of anything about the channel. Then its membership: an id
+    nobody has, and an active member who is not in the channel, are each `user_not_in_channel`.
+    A missing `user` is named before a missing `channel`.
     """
     conn = auth.conn(request)
     caller, err = _caller_or_error(request)
     if err is not None:
         return err
-    if err := _missing_argument(request, "channel", "user"):
+    if err := _missing_argument(request, "user", "channel"):
         return err
+    uid = _param(request, "user") or ""
+    if not _SLACK_USER_ID.fullmatch(uid):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "invalid_arguments",
+                "response_metadata": {
+                    "messages": [
+                        "[ERROR] input must match regex pattern: "
+                        f"{_SLACK_USER_ID.pattern} [json-pointer:/user]"
+                    ]
+                },
+            }
+        )
     name, err = _writable_channel(request, conn, caller)
     if err is not None:
         return err
-    uid = _param(request, "user") or ""
-    known = uid == SERVICE_USER_ID or any(
-        synth.slack_user_id(e) == uid for e in store.all_user_emails(conn)
-    )
-    if not known and not _slack_author_by_uid(request, conn, uid):
-        # Measured on an id nobody has (`U00000000`). Whether real also refuses a person who is
-        # simply not in the channel was not measured, and a public channel's membership here is
-        # having spoken -- which a written message deliberately does not confer -- so refusing on
-        # that would refuse a caller posting to themselves.
+    email = next(
+        (e for e in store.all_user_emails(conn) if synth.slack_user_id(e) == uid), None
+    ) or _slack_author_by_uid(request, conn, uid)
+    if uid != SERVICE_USER_ID and not _in_channel(conn, name, email):
         return _err("user_not_in_channel")
     return {"ok": True, "message_ts": synth.slack_fmt_ts(int(time.time()), f"ephemeral:{name}")}
+
+
+def _in_channel(conn, name: str, email: str | None) -> bool:
+    """Whether this person is in the channel, for the one method that refuses on it.
+
+    A PRIVATE channel's members are its grantees, which the corpus states outright. A public
+    one's are its speakers, which a written message deliberately does not join — so a caller who
+    has posted here but never spoke in the corpus would be refused their own ephemeral, and the
+    public side answers yes for anyone the corpus knows instead. The private side is the half
+    real was measured on.
+    """
+    if not email:
+        return False
+    members = store.slack_private_channel_members(conn, name)
+    return email in members if members is not None else True
 
 
 def _own_message(request: Request, conn, caller: Caller, ts_param: str, refusal: str):
@@ -2400,6 +2431,12 @@ def _reacted_by(conn, address: str) -> list[tuple[str, str]]:
     ordered by the rowid their last write gave them, and then the corpus's own column. The
     corpus side is prefiltered in SQL on the address appearing in the stored JSON, so the scan
     is one pass over a column rather than a decode of every message.
+
+    Two ways this is not real's order, both measured 2026-10-22 and both wanting a per-reaction
+    time the corpus does not carry. Real orders by when THIS person reacted, where a patch's
+    rowid moves whenever anyone reacts to that message; and real lists one item per REACTION, so
+    a message the caller put two emoji on appears twice. Recorded rather than invented: a corpus
+    states a message's reactions as a set with no times in it.
     """
     patch = overlay.table_names("slack")["patch"]
     out: list[tuple[str, str]] = []
@@ -2678,15 +2715,24 @@ async def reactions_list(request: Request):
     if offset is None:
         return _err("invalid_cursor")
     author, _uid_ = _writer(caller)
-    if wanted := _param(request, "user"):
+    wanted = _param(request, "user")
+    if wanted is not None:
+        # Read as SENT, not as absent-when-empty: measured 2026-10-22, `user=` is
+        # `user_not_found` on real, as a lower-cased id is.
         author = next(
             (e for e in store.all_user_emails(conn) if synth.slack_user_id(e) == wanted), None
         ) or (SERVICE_EMAIL if wanted == SERVICE_USER_ID else None)
         if author is None:
             return _err("user_not_found")
     ids = auth.visible_ids(request, caller)
+    limit = counts["limit"] if counts["limit"] > 0 else get_settings().default_page_size
     items = []
+    # One document fetched per item SERVED, plus one to see whether a cursor is wanted — not one
+    # per message the caller has ever reacted to. A caller with 2,000 of them paid 90 ms a call
+    # to build a list of which twenty were then kept.
     for channel, ts in _reacted_by(conn, author):
+        if len(items) > offset + limit:
+            break
         row = store.document_by_key(conn, "slack", (channel, ts), ids)
         if row is None:  # deleted, or no longer visible to this caller
             continue
@@ -2697,9 +2743,9 @@ async def reactions_list(request: Request):
                 "message": _message(row) | {"permalink": _permalink(channel, row)},
             }
         )
-    limit = counts["limit"] if counts["limit"] > 0 else get_settings().default_page_size
     page = items[offset : offset + limit]
-    cursor = next_cursor(offset, len(page), len(items))
+    # `len(items)` is the page plus at most one, which is all `next_cursor` needs to know.
+    cursor = next_cursor(offset, len(page), offset + len(items[offset:]))
     return {"ok": True, "items": page, "response_metadata": {"next_cursor": cursor}}
 
 

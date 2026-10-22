@@ -2809,7 +2809,7 @@ def test_writing_to_a_non_writable_source_is_refused(ov_db):
         store.insert_document(ov_db, "gmail", {"id": "x", "mailbox": "m"})
 
 
-@pytest.mark.parametrize("terms", ["deploy", "gateway", "gateway 502s", "the", "the the"])
+@pytest.mark.parametrize("terms", ["deploy", "gateway", "from the gateway", "the", "the the"])
 def test_python_bm25_agrees_with_sqlite_on_corpus_rows(ov_db, terms):
     # The scorer is only worth anything if it reproduces SQLite's number on rows SQLite scored.
     # A fixture asserting hand-picked constants would pass while being wrong.
@@ -2870,6 +2870,79 @@ def test_python_bm25_agrees_with_sqlite_where_the_idf_clamp_fires(tmp_path):
         mine = store._corpus_bm25(conn, "slack", "common", row["rid"], schema="main")
         assert mine == pytest.approx(row["r"], rel=1e-9), row["rid"]
     conn.close()
+
+
+def test_a_phrase_is_scored_as_one_unit_not_as_its_tokens(ov_db):
+    # `_corpus_stats` records what the phrase path does: the document frequency is the phrase's,
+    # read off the corpus index, not the sum of its tokens' IDFs. Turning the branch off leaves
+    # a score built from terms that are each far commoner than the phrase.
+    terms = store._fts_query_terms(ov_db, "slack", "from the gateway")
+    match = store._fts_match("from the gateway", phrase=True)
+    as_phrase = store._corpus_stats(ov_db, "slack", terms, phrase=match)
+    as_terms = store._corpus_stats(ov_db, "slack", terms)
+    assert list(as_phrase.n_docs) == [match]
+    assert set(as_terms.n_docs) == set(terms)
+    row = ov_db.execute(
+        "SELECT slack_fts.rowid AS rid FROM slack_fts WHERE slack_fts MATCH ? LIMIT 1", (match,)
+    ).fetchone()
+    assert row is not None, "the sample corpus has no row holding the phrase"
+    phrased = store._corpus_bm25(
+        ov_db,
+        "slack",
+        "from the gateway",
+        row["rid"],
+        schema="main",
+        terms=terms,
+        stats=as_phrase,
+        phrase=True,
+    )
+    summed = store._corpus_bm25(
+        ov_db,
+        "slack",
+        "from the gateway",
+        row["rid"],
+        schema="main",
+        terms=terms,
+        stats=as_terms,
+    )
+    assert phrased != summed
+    # And it is ONE term's score with the phrase's own document count, not a sum over however
+    # many tokens the phrase has.
+    inst = store._vocab(ov_db, "main", "slack_fts", "instance")
+    doclen = ov_db.execute(f"SELECT COUNT(*) FROM {inst} WHERE doc = ?", (row["rid"],)).fetchone()[
+        0
+    ]
+    assert phrased == pytest.approx(
+        -store._bm25_term(1, as_phrase.n_docs[match], as_phrase.n_rows, doclen, as_phrase.avgdl),
+        rel=1e-9,
+    )
+
+
+def test_the_corpus_size_cache_is_keyed_on_the_corpus_file(tmp_path):
+    # Two corpora in one process must not share one `(rows, average length)`: the key carries
+    # the file's path, size and mtime, and dropping any of that answers the second corpus with
+    # the first's numbers.
+    from tests._helpers import build_corpus
+
+    sizes = []
+    for n in (2, 9):
+        settings = build_corpus(
+            tmp_path / f"c{n}",
+            [
+                {
+                    "source_type": "slack",
+                    "channel": "sized",
+                    "author_email": "ava@acme.com",
+                    "visibility": "public",
+                    "content": f"word {i}",
+                }
+                for i in range(n)
+            ],
+        )
+        conn = store.connect_ro(settings.db_path)
+        sizes.append(store._corpus_size(conn, "slack"))
+        conn.close()
+    assert sizes[0][0] == 2 and sizes[1][0] == 9, sizes
 
 
 def test_a_posted_message_is_findable_by_search(ov_db):
