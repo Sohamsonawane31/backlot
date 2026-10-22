@@ -80,14 +80,21 @@ gives an app-posted message.
 
 ## What is not modelled
 
-Each of these is recorded in `backlot/fidelity/baseline/slack.json` with the measurement behind
-it, rather than left for a caller to discover.
+Each is measured, and the ones `backlot diff` can see are recorded in
+`backlot/fidelity/baseline/slack.json` with the measurement behind them. The comparison reads a
+field list, so the ordering divergence below has no entry to live in and is stated only here.
 
 - **OAuth scopes.** Real Slack splits some answers on scope rather than on identity: posting to a
   public channel you have not joined succeeds with `chat:write.public` and answers
   `not_in_channel` without it. Backlot has no scope concept and takes the permissive branch.
-- **An app identity.** Real adds `app_id`, `bot_id`, `bot_profile` and `parent_user_id` to the
-  message a write echoes back. A corpus has nothing to populate them from.
+- **An app identity.** Real adds `app_id`, `bot_profile` and `parent_user_id` to the message a
+  write echoes back. A corpus has nothing to populate them from. `bot_id` is served: real
+  carries it on every message posted through the Web API, over a user token as well as a bot
+  one, so it is keyed on the author rather than on the token.
+- **Per-reaction times.** Real orders `reactions.list` by when the caller reacted and lists one
+  item per reaction, so a message the caller put two emoji on appears twice. A corpus states a
+  message's reactions as a set with no times in it, so Backlot orders by the message and lists
+  it once.
 - **The emoji set.** `reactions.add` takes any name; real answers `invalid_name` for one its
   workspace does not have. Validating it needs Slack's emoji list, and a partial list would
   refuse names real accepts.
