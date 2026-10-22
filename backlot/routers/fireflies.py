@@ -129,6 +129,7 @@ async def graphql(request: Request):
         "roster": frozenset(state.acl.email_to_token()) if getattr(state, "acl", None) else None,
     }
     result = ENGINE.execute_payload(payload, context=context)
+    request.state.graphql_raised = result.raised
     # Fireflies' refusal of an argument carries two more members than a field error, in this order
     # (api.fireflies.ai, 2026-10-21).
     errors = result.payload.get("errors", [])

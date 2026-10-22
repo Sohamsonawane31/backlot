@@ -88,11 +88,14 @@ class Result:
 
     ``request_error`` marks the pre-execution failures above; routers map it to the status
     code their vendor uses (real Linear answers a malformed document with 400, while a
-    field error is still a 200 with ``errors``).
+    field error is still a 200 with ``errors``). ``raised`` marks a field error whose exception
+    is not a ``GraphQLError``: the resolvers raise their refusals as ``GraphQLError``, so any
+    other exception is one they did not mean to raise.
     """
 
     payload: dict
     request_error: bool = False
+    raised: bool = False
 
 
 def _request_error(errors: list[GraphQLError]) -> Result:
@@ -203,7 +206,13 @@ class Engine:
         # graphql-core's ExecutionResult.formatted writes "data" first; api.fireflies.ai and
         # api.linear.app open a response carrying a field error with "errors" (2026-10-21), so flip
         # the two members here.
-        return Result(payload=dict(reversed(list(result.formatted.items()))))
+        return Result(
+            payload=dict(reversed(list(result.formatted.items()))),
+            raised=any(
+                e.original_error is not None and not isinstance(e.original_error, GraphQLError)
+                for e in result.errors or ()
+            ),
+        )
 
     def execute_payload(self, payload: Any, *, context: Any = None) -> Result:
         """Run a GraphQL-over-HTTP POST body (``{query, variables, operationName}``) its router has

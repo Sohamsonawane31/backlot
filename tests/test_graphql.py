@@ -205,6 +205,33 @@ def test_partial_data_survives_alongside_an_error(gql):
     assert list(gql.execute('{ widget(id: "w1") { name } }').payload) == ["data"]
 
 
+def _placed(_root, info):
+    raise GraphQLError("refused where it was raised", path=info.path.as_list())
+
+
+def _crashed(_root, _info):
+    raise ValueError("cannot convert float NaN to integer")
+
+
+@pytest.mark.parametrize(
+    "query, raised",
+    [
+        ('{ widget(id: "w1") { name } }', False),
+        ("{ boom }", False),
+        ("{ placed }", False),
+        ("{ crashed }", True),
+        ("{ boom crashed }", True),
+    ],
+)
+def test_a_field_error_is_marked_raised_when_its_exception_is_not_a_graphql_error(query, raised):
+    gql = engine.Engine(
+        SDL.replace("boom: String", "boom: String\n  placed: String\n  crashed: String"),
+        {"Query": {**RESOLVERS["Query"], "placed": _placed, "crashed": _crashed}},
+    )
+    r = gql.execute(query)
+    assert (r.request_error, r.raised) == (False, raised)
+
+
 # --- operation selection --------------------------------------------------------
 
 
