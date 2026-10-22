@@ -118,10 +118,10 @@ def _source_ddl(conn: sqlite3.Connection, source_type: str) -> list[str]:
     return [
         # The document mirror, and the ACL rows a written document needs: a grant names its
         # document by ID_COLUMNS, so a row written without grants is visible to nobody at all,
-        # including its own author. `revoked` is what a later revocation of a CORPUS grant will
+        # including its own author. A later revocation of a CORPUS grant will
         # set, since a corpus row cannot be deleted.
         _mirror_ddl(conn, names["doc"]),
-        _mirror_ddl(conn, names["acl"], extra=", revoked INTEGER NOT NULL DEFAULT 0"),
+        _mirror_ddl(conn, names["acl"]),
         # An overwrite of ONE column of a row that may live in either database. A corpus row is a
         # dozen columns and copying it to change one only moves the question of which copy is
         # authoritative; this says exactly what changed.
@@ -145,31 +145,29 @@ def _source_ddl(conn: sqlite3.Connection, source_type: str) -> list[str]:
 def _acl_view_ddl(conn: sqlite3.Connection, source_type: str) -> str:
     """A ``temp`` view that shadows the source's ACL table with corpus-plus-overlay grants.
 
-    Sixty-seven call sites reach the ACL through :func:`store._acl_clause`, which emits an
+    Seventy-four call sites reach the ACL through :func:`store._acl_clause`, which emits an
     unqualified table name — so an overlay grant would be invisible to every one of them, and a
     posted message would be readable by nobody including its author. Threading a connection
-    through all seventy-four to union the two tables would be the alternative.
+    through all of them to union the two tables would be the alternative.
 
     A ``temp`` view is the whole fix instead, because SQLite resolves an unqualified name in
     ``temp`` before ``main`` (measured). Every reader keeps its query verbatim and sees one ACL
     relation; ``main.<acl>`` stays reachable, qualified, for the writer that copies grants.
 
-    A row in ``ov.<acl>`` with ``revoked = 1`` hides the matching corpus grant, which is how a
-    grant on an unwritable corpus row is taken away. Nothing writes one yet —
-    `conversations.kick` will — but expressing it here is what keeps that from being a change to
-    this view.
+    Created by the first write, not by `attach`: a `UNION ALL` is not free even over an empty
+    table, and a server nothing has been written to should read the ACL table itself. With a
+    person's token, `conversations.history` over a 200,000-message channel took 94 ms behind the
+    view against 72 ms on `main.<acl>`.
     """
     names = table_names(source_type)
     acl = names["acl"]
     cols = [r[1] for r in conn.execute(f"PRAGMA main.table_info({acl})")]
     projection = ", ".join(cols)
-    match = " AND ".join(f"r.{c} = m.{c}" for c in cols)
     return (
         f"CREATE VIEW IF NOT EXISTS temp.{acl} AS "
-        f"SELECT {projection} FROM main.{acl} m WHERE NOT EXISTS ("
-        f"  SELECT 1 FROM ov.{acl} r WHERE {match} AND r.revoked = 1) "
+        f"SELECT {projection} FROM main.{acl} "
         f"UNION ALL "
-        f"SELECT {projection} FROM ov.{acl} WHERE revoked = 0"
+        f"SELECT {projection} FROM ov.{acl}"
     )
 
 
@@ -179,8 +177,17 @@ def attach(conn: sqlite3.Connection, name: str) -> None:
     for source_type in sorted(store.WRITABLE):
         for ddl in _source_ddl(conn, source_type):
             conn.execute(ddl)
-        conn.execute(_acl_view_ddl(conn, source_type))
     conn.commit()
+
+
+def ensure_acl_view(conn: sqlite3.Connection, source_type: str) -> None:
+    """Put the ACL view in front of the corpus's table, if it is not there already.
+
+    Called by every write rather than by :func:`attach`, so a server nothing has been written to
+    reads `main.<acl>` with its own index (:func:`_acl_view_ddl`). `CREATE VIEW IF NOT EXISTS`
+    makes the repeat calls free.
+    """
+    conn.execute(_acl_view_ddl(conn, source_type))
 
 
 def detach(conn: sqlite3.Connection) -> None:

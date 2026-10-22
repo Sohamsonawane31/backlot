@@ -1496,6 +1496,12 @@
           "kind": "missing_field",
           "severity": "gap"
         },
+        "message.blocks": {
+          "kind": "extra_field",
+          "severity": "breaking",
+          "detail": "Backlot serves it; the vendor's reference documents no such field",
+          "note": "Measured against slack.com on 2026-10-22: a plain-text post over a user token and over a bot token both carried `blocks`, in the echo and in `conversations.history`, as did the messages `reactions.get` and `reactions.list` answer. The reference's example for this method abbreviates its message, so this records the example being shorter than the answer rather than Backlot answering more than real does."
+        },
         "message.subtype": {
           "kind": "missing_field",
           "severity": "gap",
@@ -1611,6 +1617,12 @@
         }
       },
       "fields": {
+        "message.blocks": {
+          "kind": "extra_field",
+          "severity": "breaking",
+          "detail": "Backlot serves it; the vendor's reference documents no such field",
+          "note": "Measured against slack.com on 2026-10-22: a plain-text post over a user token and over a bot token both carried `blocks`, in the echo and in `conversations.history`, as did the messages `reactions.get` and `reactions.list` answer. The reference's example for this method abbreviates its message, so this records the example being shorter than the answer rather than Backlot answering more than real does."
+        },
         "message.bot_id": {
           "kind": "extra_field",
           "severity": "breaking",
@@ -2820,6 +2832,12 @@
           "kind": "missing_field",
           "severity": "gap"
         },
+        "message.blocks": {
+          "kind": "extra_field",
+          "severity": "breaking",
+          "detail": "Backlot serves it; the vendor's reference documents no such field",
+          "note": "Measured against slack.com on 2026-10-22: a plain-text post over a user token and over a bot token both carried `blocks`, in the echo and in `conversations.history`, as did the messages `reactions.get` and `reactions.list` answer. The reference's example for this method abbreviates its message, so this records the example being shorter than the answer rather than Backlot answering more than real does."
+        },
         "message.bot_id": {
           "kind": "extra_field",
           "severity": "breaking",
@@ -2866,6 +2884,12 @@
         "items[].file": {
           "kind": "missing_field",
           "severity": "gap"
+        },
+        "items[].message.blocks": {
+          "kind": "extra_field",
+          "severity": "breaking",
+          "detail": "Backlot serves it; the vendor's reference documents no such field",
+          "note": "Measured against slack.com on 2026-10-22: a plain-text post over a user token and over a bot token both carried `blocks`, in the echo and in `conversations.history`, as did the messages `reactions.get` and `reactions.list` answer. The reference's example for this method abbreviates its message, so this records the example being shorter than the answer rather than Backlot answering more than real does."
         },
         "items[].message.edited": {
           "kind": "extra_field",

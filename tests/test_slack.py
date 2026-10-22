@@ -4633,8 +4633,11 @@ def test_a_json_body_is_read_only_where_the_spec_declares_one(wclient, tokens, m
         "user": synth.slack_user_id("ava@acme.com"),
     }
     answered = wclient.post(f"/slack/api/{method}", headers=h, json=body).json()
-    saw_the_arguments = answered.get("error") != "invalid_arguments"
-    assert saw_the_arguments is reads_json, (method, answered)
+    # Method-agnostic: a method that does not read the body answers exactly what it answers
+    # with no body at all, whatever that answer is.
+    empty = wclient.post(f"/slack/api/{method}", headers=h, json={}).json()
+    saw_the_arguments = answered != empty
+    assert saw_the_arguments is reads_json, (method, answered, empty)
 
 
 def test_reactions_remove_takes_off_the_name_it_was_given(wclient, tokens):
@@ -5310,21 +5313,47 @@ def test_a_thread_ts_naming_nothing_posts_top_level_and_an_unreadable_one_is_ref
         ).json()
         assert j["ok"] is True, value
         assert "thread_ts" not in j["message"], value
-    assert wclient.post(
-        "/slack/api/chat.postMessage",
-        headers=h,
-        data={"channel": cid, "text": "orphan", "thread_ts": "abc"},
-    ).json() == {
-        "ok": False,
-        "error": "invalid_thread_ts",
-        "response_metadata": {"messages": ["[ERROR] 0 is not a valid thread_ts"]},
-    }
+    # Refused outside the window `_thread_ts_error` records, and the message carries the value
+    # as real reads it, in microseconds.
+    import time as _time
+
+    for value, micros in (
+        ("abc", 0),
+        ("-1", 1_000_000),
+        ("1.2.3", 1_000_002),
+        ("1e9", 19_000_000),
+        ("0000000000.000001", 1),
+        ("631152000.000000", 631_152_000_000_000),
+        (str(int(_time.time()) + 7200), None),
+    ):
+        answered = wclient.post(
+            "/slack/api/chat.postMessage",
+            headers=h,
+            data={"channel": cid, "text": "orphan", "thread_ts": value},
+        ).json()
+        assert answered["ok"] is False, value
+        assert answered["error"] == "invalid_thread_ts", value
+        if micros is not None:
+            assert answered["response_metadata"]["messages"] == [
+                f"[ERROR] {micros} is not a valid thread_ts"
+            ], value
+    # And the floor is a second wide: one second above it posts.
+    assert (
+        wclient.post(
+            "/slack/api/chat.postMessage",
+            headers=h,
+            data={"channel": cid, "text": "just inside", "thread_ts": "631152001.000000"},
+        ).json()["ok"]
+        is True
+    )
 
 
 @pytest.mark.parametrize("who", ["admin", "person"])
-def test_bot_id_marks_an_app_post_and_only_an_app_post(wclient, tokens, admin_h, who):
-    # `_message` records the measurement: real carries `bot_id` on a message an app posted, in
-    # history as well as in the echo, and no `subtype` on either. A person's message has neither.
+def test_a_posted_message_carries_bot_id_and_blocks_and_no_subtype(wclient, tokens, admin_h, who):
+    # `_message` records the measurement: real carries `bot_id` and `blocks` on every message
+    # posted over the Web API, under a user token as well as a bot one, in history as well as in
+    # the echo, and no `subtype` on either. A corpus message carries `client_msg_id` and no
+    # `bot_id`, since it stands for one a Slack client posted.
     h = admin_h if who == "admin" else _uh(tokens, "ava@acme.com")
     cid = synth.slack_channel_id("incidents")
     ts = wclient.post(
@@ -5334,8 +5363,11 @@ def test_bot_id_marks_an_app_post_and_only_an_app_post(wclient, tokens, admin_h,
         "/slack/api/conversations.history", headers=admin_h, data={"channel": cid, "limit": 200}
     ).json()["messages"]
     msg = [m for m in hist if m["ts"] == ts][0]
-    assert ("bot_id" in msg) is (who == "admin")
-    assert "subtype" not in msg
+    assert "bot_id" in msg and "blocks" in msg
+    assert "subtype" not in msg and "client_msg_id" not in msg
+    corpus = [m for m in hist if m["ts"] != ts and "client_msg_id" in m]
+    assert corpus, "the sample corpus has no plain message to contrast with"
+    assert "bot_id" not in corpus[0]
 
 
 def test_an_author_with_a_differently_cased_address_can_edit_their_own_message(wclient, tokens):

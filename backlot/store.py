@@ -1285,7 +1285,7 @@ def insert_document(conn, source_type: str, values: dict) -> None:
     container it landed in. Without them it is visible to nobody: a grant names its document by
     :func:`id_columns`, so a row with no ACL rows fails every ``_acl_clause``.
 
-    A corpus grant the overlay has revoked is not copied. Nothing writes a revocation yet, but the
+    The copy reads the corpus's grants directly. Nothing revokes one yet, but the
     ACL view already honours one, and the two have to agree — otherwise the next message posted to
     a channel would re-grant the principal a kick had just removed from it.
     """
@@ -1304,6 +1304,7 @@ def insert_document(conn, source_type: str, values: dict) -> None:
     if unknown := set(cols) - known:
         raise ValueError(f"{source_type}: no such column(s) {sorted(unknown)} on {tbl}")
     key_cols = ", ".join(key)
+    overlay.ensure_acl_view(conn, source_type)
     with overlay.LOCK:
         conn.execute(
             f"INSERT INTO ov.{tbl} ({', '.join(cols)}) VALUES ({','.join('?' for _ in cols)})",
@@ -1312,12 +1313,10 @@ def insert_document(conn, source_type: str, values: dict) -> None:
         conn.execute(
             f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
             f"SELECT {', '.join('?' for _ in key)}, principal_type, principal_id FROM ("
-            f"  SELECT DISTINCT m.principal_type, m.principal_id FROM main.{names['acl']} m "
-            f"  WHERE m.{container} = ? AND NOT EXISTS ("
-            f"    SELECT 1 FROM ov.{names['acl']} r WHERE r.{container} = m.{container} "
-            f"      AND r.principal_id = m.principal_id AND r.revoked = 1)"
+            f"  SELECT DISTINCT principal_type, principal_id FROM main.{names['acl']} "
+            f"  WHERE {container} = ?"
             f"  UNION SELECT DISTINCT principal_type, principal_id FROM ov.{names['acl']} "
-            f"  WHERE {container} = ? AND revoked = 0"
+            f"  WHERE {container} = ?"
             f")",
             [*(values[c] for c in key), values[container], values[container]],
         )
@@ -1400,6 +1399,7 @@ def tombstone_document(conn, source_type: str, key: tuple) -> None:
     names = overlay.table_names(source_type)
     cols = id_columns(source_type)
     where = " AND ".join(f"{c} = ?" for c in cols)
+    overlay.ensure_acl_view(conn, source_type)
     with overlay.LOCK:
         conn.execute(
             f"INSERT OR IGNORE INTO ov.{names['tombstone']} ({', '.join(cols)}) "
@@ -1503,6 +1503,32 @@ def slack_next_ts(conn, channel: str, epoch_sec: int) -> str:
         if fraction not in taken:
             return f"{int(epoch_sec)}.{fraction:06d}"
     raise RuntimeError(f"slack: channel {channel!r} has no free ts fraction in second {epoch_sec}")
+
+
+def merged_sides(conn, source_type: str) -> list[tuple[str, str]]:
+    """Each side of what :func:`merged_source` unions, as ``(FROM expression, extra WHERE)``.
+
+    For a reader that wants `ORDER BY … LIMIT`: a compound subquery cannot use either side's
+    index, so ordering over the union scans the channel where asking each side separately is a
+    seek — 158 ms against 3 ms on a 200,000-message channel. The caller asks each side and keeps
+    the better row.
+
+    The FROM is aliased to the corpus table's own name, as `merged_source`'s is, so
+    `_acl_clause` reads the same identifier. Patches are NOT applied: this is for the identifier
+    and ordering columns, which :data:`PATCHABLE` does not cover for any source.
+    """
+    from backlot import overlay
+
+    tbl = table(source_type)
+    if source_type not in WRITABLE or not overlay.is_attached(conn):
+        return [(f"main.{tbl} {tbl}", "")]
+    names = overlay.table_names(source_type)
+    on = " AND ".join(f"x.{c} = {tbl}.{c}" for c in id_columns(source_type))
+    alive = f" AND NOT EXISTS (SELECT 1 FROM ov.{names['tombstone']} x WHERE {on})"
+    sides = [(f"main.{tbl} {tbl}", alive)]
+    if _overlay_holds_anything(conn, names):
+        sides.append((f"ov.{tbl} {tbl}", alive))
+    return sides
 
 
 def _overlay_holds_anything(conn, names: dict[str, str]) -> bool:
@@ -3156,17 +3182,35 @@ def _overlay_matches(conn, source_type, query, visible_ids, *, container, phrase
     }
     if not hits:
         return []
-    where = " OR ".join(f"({' AND '.join(f'o.{c} = ?' for c in key)})" for _ in hits)
-    params: list = [v for k in hits for v in k]
-    cont_sql = ""
-    if container is not None:
-        cont_sql = f" AND o.{grouping_col(source_type)} = ?"
-        params.append(container)
-    clause, cparams = _acl_clause(source_type, "o", visible_ids)
-    rows = conn.execute(
-        f"SELECT o.* FROM ({merged_source(conn, source_type)}) o WHERE ({where}){cont_sql}{clause}",
-        [*params, *cparams],
-    ).fetchall()
+    # The keys go in a temp table and are JOINED, not spelt as one `OR` term per hit. An OR chain
+    # is an expression tree as deep as the hit count, and SQLite refuses one deeper than 1,000:
+    # a search matching 990 written rows answered `Expression tree is too large`. A join does not
+    # grow the expression at all, so the ceiling is the overlay's own size.
+    with overlay.LOCK:
+        conn.execute("DROP TABLE IF EXISTS temp.overlay_hits")
+        conn.execute(
+            f"CREATE TEMP TABLE overlay_hits ({', '.join(f'{c} TEXT' for c in key)}, "
+            f"PRIMARY KEY ({', '.join(key)}))"
+        )
+        conn.executemany(
+            f"INSERT OR IGNORE INTO temp.overlay_hits ({', '.join(key)}) "
+            f"VALUES ({','.join('?' for _ in key)})",
+            list(hits),
+        )
+        on = " AND ".join(f"h.{c} = o.{c}" for c in key)
+        params: list = []
+        cont_sql = ""
+        if container is not None:
+            cont_sql = f" AND o.{grouping_col(source_type)} = ?"
+            params.append(container)
+        clause, cparams = _acl_clause(source_type, "o", visible_ids)
+        rows = conn.execute(
+            f"SELECT o.* FROM temp.overlay_hits h "
+            f"JOIN ({merged_source(conn, source_type)}) o ON {on} "
+            f"WHERE 1{cont_sql}{clause}",
+            [*params, *cparams],
+        ).fetchall()
+        conn.execute("DROP TABLE IF EXISTS temp.overlay_hits")
     return [(r, hits[tuple(r[c] for c in key)]) for r in rows]
 
 
@@ -3542,14 +3586,22 @@ def slack_latest_ts(conn, channel, visible_ids=None) -> str | None:
 
     Ordered by ``created_ts`` rather than ``MAX(ts)`` for the reason slack_latest_reply_ts gives:
     ts is TEXT, so a max over it is lexicographic and picks the wrong row when a channel straddles
-    a digit-count change in the epoch second."""
-    sql = f"SELECT ts FROM {merged_source(conn, 'slack')} WHERE channel = ?"
-    params: list = [channel]
+    a digit-count change in the epoch second.
+
+    Asked of each side separately (:func:`merged_sides`) and the newer kept, because an
+    `ORDER BY … LIMIT 1` over the union cannot use either side's index.
+    """
     clause, cparams = _acl_clause("slack", visible_ids=visible_ids)
-    row = conn.execute(
-        sql + clause + " ORDER BY created_ts DESC, ts DESC LIMIT 1", params + cparams
-    ).fetchone()
-    return row[0] if row else None
+    best: tuple | None = None
+    for src, alive in merged_sides(conn, "slack"):
+        row = conn.execute(
+            f"SELECT ts, created_ts FROM {src} WHERE channel = ?{alive}{clause} "
+            "ORDER BY created_ts DESC, ts DESC LIMIT 1",
+            [channel, *cparams],
+        ).fetchone()
+        if row is not None and (best is None or (row[1], row[0]) > best):
+            best = (row[1], row[0])
+    return best[1] if best else None
 
 
 def slack_latest_reply_ts(conn, channel, thread_ts, visible_ids=None) -> str | None:
