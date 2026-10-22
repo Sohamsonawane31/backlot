@@ -4917,11 +4917,11 @@ def test_every_write_method_names_each_argument_it_requires(wclient, tokens, met
         ), (method, name)
 
 
-@pytest.mark.parametrize("method", sorted(_WRITE_METHODS))
+@pytest.mark.parametrize(
+    "method", sorted(m for m, (args, _) in _WRITE_METHODS.items() if "channel" in args)
+)
 def test_every_write_method_hides_a_channel_the_caller_cannot_see(wclient, tokens, method):
     args, _ = _WRITE_METHODS[method]
-    if "channel" not in args:
-        pytest.skip("addresses no channel")
     # bob cannot see people-confidential, and must be told it does not exist rather than
     # anything about what is in it.
     sent = {

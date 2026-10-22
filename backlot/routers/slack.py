@@ -2091,11 +2091,14 @@ async def chat_post_message(request: Request):
     TOP-LEVEL and carries no `thread_ts` back, as an empty one does. What is refused is a value
     outside the window real accepts — see :func:`_thread_ts_error`.
 
-    Arguments the vendor documents and Backlot still ignores: `blocks`, `attachments`, `as_user`,
-    `username`, `icon_emoji`, `icon_url`, `reply_broadcast`, `unfurl_links`, `unfurl_media`,
-    `parse`, `link_names`, `mrkdwn`. `backlot diff` cannot see them -- it compares query parameters
-    and Slack's spec declares these as form fields (see `backlot/fidelity/operations.py`) -- so
-    this list is the record until that gap is closed.
+    `blocks` and `attachments` decide whether the message has content, and nothing more: the
+    `blocks` the message reads back with are composed from its `text` (`synth.slack_blocks`), as
+    a corpus message's are, rather than being the ones the caller sent. Arguments the vendor
+    documents and Backlot ignores outright: `as_user`, `username`, `icon_emoji`, `icon_url`,
+    `reply_broadcast`, `unfurl_links`, `unfurl_media`, `parse`, `link_names`, `mrkdwn`.
+    `backlot diff` cannot see them -- it compares query parameters and Slack's spec declares
+    these as form fields (see `backlot/fidelity/operations.py`) -- so this list is the record
+    until that gap is closed.
     """
     conn = auth.conn(request)
     caller, err = _caller_or_error(request)
