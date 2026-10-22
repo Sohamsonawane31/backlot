@@ -3,10 +3,11 @@
 Mirage (https://github.com/strukto-ai/mirage) is a virtual filesystem for AI agents: you mount a
 SaaS backend and read it with bash-style commands (``ls``, ``cat``, ``grep``, ``find``).
 
-Slack, Notion and S3 take the host as a config field, so they need nothing from here — pass
-Backlot's URL for the resource in (``f"{base_url}/slack/api"``, ``…/notion/v1``, ``…/s3``).
+Slack, Notion, S3 and Linear take the host as a config field, so they need nothing from here —
+pass Backlot's URL for the VFS in (``f"{base_url}/slack/api"``, ``…/notion/v1``, ``…/s3``,
+``…/linear/graphql``).
 Google offers only a single-host override, and Backlot needs a distinct prefix per API; GitHub's
-own ``base_url`` reaches a resource but not one constructed without it. ``point_google_at`` /
+own ``base_url`` reaches a VFS but not one constructed without it. ``point_google_at`` /
 ``point_github_at`` therefore rebind the corresponding constants in ``mirage.core.*.constants``.
 """
 
@@ -77,7 +78,7 @@ def point_google_at(base_url: str) -> None:
 
     The consuming submodules import them BY VALUE (``from ...constants import GMAIL_API_BASE``), so
     both the source and every already-imported copy are rebound — that is what makes this
-    order-independent. Idempotent; call once, before constructing the Google resources.
+    order-independent. Idempotent; call once, before constructing a Google VFS.
     """
     base = base_url.rstrip("/")
     _rebind_mirage_constants(
@@ -110,9 +111,9 @@ def point_github_at(base_url: str) -> None:
     would leave every request pointed at api.github.com.
 
     Unlike Google's, this rebind is not forced — ``GitHubConfig.base_url`` is a real seam, threaded
-    to every call site in ``mirage.core.github`` — but it is what redirects a resource built without
-    that field set. Call once, before constructing ``GitHubResource``: its constructor already makes
-    HTTP calls (default branch, tree).
+    to every call site in ``mirage.core.github`` — but it is what redirects a VFS built without
+    that field set. Call once, before the VFS's first command: that command fetches the default
+    branch and the tree.
     """
     base = base_url.rstrip("/")
     _rebind_mirage_constants("mirage.core.github.constants", {"API_BASE": f"{base}/github"})
