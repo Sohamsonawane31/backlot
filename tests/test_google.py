@@ -28,6 +28,7 @@ from tests._helpers import (
     crawl_drive,
     crawl_gmail,
     db_count,
+    sent_as,
     served_id,
     tiny_corpus,
     tok,
@@ -1210,6 +1211,77 @@ def test_google_batch_passes_on_no_location_on_the_host_it_sends_parts_to(client
     assert (alone.status_code, "location" in alone.headers) == (302, True)
     status, lines, _ = _batch_answer(client, admin_h, _DRIVE_BATCH, "GET", target, None, None)
     assert (status, lines) == (302, ["Content-Type: text/html;charset=utf-8"])
+
+
+# A Drive batch part whose path carries a `;`, as real's Drive batch answered each one. A row is
+# the part's target, the status in the batch and what the answer carries: a 302's `Location`
+# below the server's base URL, a 404's message, or the top-level key a 200 carries. The last row
+# is the escaped spelling, which stays in the path. `{doc}` is a Doc's id.
+_BATCH_CUT_ROWS = [
+    ("/drive/v3/files/{doc};x?fields=id,name", 200, "id"),
+    ("/drive/v3/files/{doc};a=b;c?fields=id,name", 200, "id"),
+    ("/drive/v3/files/{doc};x/export?mimeType=text/plain", 200, "id"),
+    (
+        "/drive/v3/files/{doc}/export;x?mimeType=text/plain",
+        302,
+        "download/drive/v3/files/{doc}/export?mimeType=text/plain&quotaUser=7",
+    ),
+    ("/drive/v3/files/{doc}/permissions;x?fields=permissions(role)", 200, "permissions"),
+    ("/drive/v3/files;x?pageSize=1&fields=files(id)", 200, "files"),
+    ("/drive/v3/about;x?fields=user", 200, "user"),
+    ("/drive/v3/drives;x", 200, "drives"),
+    ("/drive/v3/files/nosuch;x", 404, "File not found: nosuch."),
+    ("/drive/v3/files/{doc}%3Bx?fields=id,name", 404, "File not found: {doc};x."),
+]
+
+
+@pytest.mark.parametrize("target, status, detail", _BATCH_CUT_ROWS)
+def test_google_drive_batch_cuts_a_part_path_at_a_semicolon(
+    client, admin_h, target, status, detail
+):
+    """The rows `_BATCH_CUT_ROWS` records, each as the one part of its batch
+    (`_drive_batch_cut_path`), and the same request on its own, which no batch cuts."""
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    ids = {"doc": doc}
+    got, lines, sub_body = _batch_answer(
+        client, admin_h, _DRIVE_BATCH, "GET", target.format(**ids), None, None
+    )
+    assert got == status, sub_body
+    if status == 302:
+        assert lines == [
+            "Content-Length: 0",
+            "Content-Type: application/json; charset=UTF-8",
+            f"Location: http://testserver/{detail.format(**ids)}",
+        ]
+        assert json.loads(sub_body) == _REDIRECTED
+    elif status == 404:
+        assert json.loads(sub_body)["error"]["message"] == detail.format(**ids)
+    else:
+        body = json.loads(sub_body)
+        assert detail in body, sub_body
+        if detail == "id":
+            assert body["id"] == doc and body["name"]
+    assert client.get(target.format(**ids), headers=admin_h).status_code == 404
+
+
+def test_google_drive_batch_cuts_every_part_path_at_a_semicolon(client, admin_h):
+    """All the `_BATCH_CUT_ROWS` targets in one batch, as they were measured in one batch, each
+    part cut on its own."""
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    payload = "".join(
+        f"--b\r\nContent-Type: application/http\r\nContent-ID: <p{i}>\r\n\r\n"
+        f"GET {target.format(doc=doc)} HTTP/1.1\r\n\r\n"
+        for i, (target, _, _) in enumerate(_BATCH_CUT_ROWS)
+    )
+    r = client.post(
+        _DRIVE_BATCH,
+        headers={**admin_h, "Content-Type": "multipart/mixed; boundary=b"},
+        content=payload + "--b--\r\n",
+    )
+    assert r.status_code == 200, r.text
+    assert [int(code) for code in re.findall(r"^HTTP/1\.1 (\d+)", r.text, re.M)] == [
+        status for _, status, _ in _BATCH_CUT_ROWS
+    ]
 
 
 _ACK = "/drive/v3/files/{doc}?acknowledgeAbuse=true&fields=id"
@@ -11734,6 +11806,97 @@ def test_gmail_from_to_searches_address_headers(tmp_path, surface, caller, query
 @pytest.mark.parametrize(
     "query, expected",
     [
+        ("plan", ["plan", "reply"]),
+        ("-plan", ["lunch"]),
+        ("--plan", ["lunch"]),
+        ("-PLAN", ["lunch"]),
+        ('-"plan"', ["lunch"]),
+        ("NOT plan", ["lunch"]),
+        ("-(plan)", ["lunch"]),
+        ("-( plan )", ["lunch"]),
+        ("plan -plan", []),
+        ("not plan", []),
+        ("label:inbox", ["plan"]),
+        ("label:inbox -plan", []),
+        ("label:sent", ["lunch", "reply"]),
+        ("label:sent -plan", ["lunch"]),
+        ('-"rollout plan"', ["lunch"]),
+        ('NOT "rollout plan"', ["lunch"]),
+        ('-("rollout plan")', ["lunch"]),
+        ('-"plan rollout"', ["plan", "lunch", "reply"]),
+        ("NOT -plan", ["plan", "reply"]),
+        ("NOT NOT plan", ["plan", "reply"]),
+        ("NOT NOT NOT plan", ["lunch"]),
+        ('NOT -"rollout plan"', ["plan", "reply"]),
+        ("-plan+", ["plan", "lunch", "reply"]),
+        ("NOT plan+", ["plan", "lunch", "reply"]),
+        ("plan -plan+", ["plan", "reply"]),
+        ('-plan "', ["lunch"]),
+    ],
+)
+def test_gmail_a_negated_word_leaves_out_the_messages_holding_it(
+    tmp_path, surface, query, expected
+):
+    """A `-` or a capital `NOT` in front of a word, and `-(…)` around one word, leave out the
+    messages that word answers (`_gmail_take_negated_words`). `not` in lower case stays a word, so
+    `not plan` searches for both."""
+    records = [
+        {
+            "doc_id": "plan",
+            "title": "Rollout plan",
+            "content": "attached",
+            "label_ids": ["INBOX"],
+            "author_email": "bob@acme.com",
+            "created": "2026-03-01T09:00:00Z",
+        },
+        {
+            "doc_id": "lunch",
+            "title": "Lunch",
+            "content": "Friday?",
+            "label_ids": ["SENT"],
+            "author_email": "mia@acme.com",
+            "created": "2026-03-02T09:00:00Z",
+        },
+        {
+            "doc_id": "reply",
+            "title": "Re: Rollout plan",
+            "content": "ok",
+            "label_ids": ["SENT"],
+            "author_email": "ava@acme.com",
+            "created": "2026-03-03T09:00:00Z",
+        },
+    ]
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "mailbox": "ava",
+                "to": "ava@acme.com",
+                "readers": ["ava@acme.com"],
+                "visibility": "public",
+                **r,
+            }
+            for r in records
+        ],
+    )
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    with client_for(settings, reload=True) as c:
+        response = c.get(
+            f"/gmail/v1/users/me/{surface}",
+            headers={"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"},
+            params={"q": query},
+        )
+    assert response.status_code == 200, response.text
+    assert {r["id"] for r in response.json().get(surface, [])} == {
+        served_id("gmail", doc_id) for doc_id in expected
+    }
+
+
+@pytest.mark.parametrize("surface", ["messages", "threads"])
+@pytest.mark.parametrize(
+    "query, expected",
+    [
         ("subject:", ["plan", "lunch", "after"]),
         ("subject: ", ["plan", "lunch", "after"]),
         ("subject:\t", ["plan", "lunch", "after"]),
@@ -12033,3 +12196,142 @@ def test_gmail_hyphenated_address_search(tmp_path, surface, query, expected):
     assert {x["id"] for x in r.json().get(surface, [])} == {
         served_id("gmail", doc_id) for doc_id in expected
     }
+
+
+_LONG_Q = " or ".join(f"name contains 'Brand{i}'" for i in range(80)) + " or name contains 'Brand'"
+_FORM = "application/x-www-form-urlencoded"
+_OVERRIDE_ROWS = [
+    # path, the query the GET sends, the URL query and the body the POST sends, `Content-Type`,
+    # `X-HTTP-Method-Override`
+    ("/drive/v3/files", f"q={_LONG_Q}&pageSize=2", "", f"q={_LONG_Q}&pageSize=2", _FORM, "GET"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM, "GET"),
+    ("/drive/v3/files/{file}", "fields=kind,mimeType", "", "fields=kind,mimeType", _FORM, "GET"),
+    ("/drive/v3/drives", "pageSize=1", "", "pageSize=1", _FORM, "GET"),
+    ("/gmail/v1/users/me/labels", "", "", "", _FORM, "GET"),
+    ("/gmail/v1/users/me/labels", "", "", "", _FORM, "HEAD"),
+    ("/docs/v1/documents/{doc}", "", "", "", _FORM, "GET"),
+    (
+        "/sheets/v4/spreadsheets/{sheet}",
+        "fields=spreadsheetId",
+        "",
+        "fields=spreadsheetId",
+        _FORM,
+        "GET",
+    ),
+    ("/sheets/v4/spreadsheets/{sheet}", "", "", "", _FORM, "\tGET "),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM, "get"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM, " GET "),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM, "HEAD"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM, "hEAD"),
+    ("/drive/v3/about", "", "", "fields=kind", None, "GET"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", f"{_FORM}; charset=UTF-8", "GET"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", _FORM.upper(), "GET"),
+    ("/drive/v3/about", "fields=kind", "", "fields=kind", f"text/plain;{_FORM}", "GET"),
+    ("/drive/v3/about", "", "", "fields=kind", _FORM[:-1], "GET"),
+    ("/drive/v3/about", "", "", "fields=kind", "text/plain", "GET"),
+    ("/drive/v3/about", "", "", '{"fields": "kind"}', "application/json", "GET"),
+    ("/drive/v3/about", "fields=user", "fields=user", "fields=kind", _FORM, "GET"),
+]
+
+
+@pytest.mark.parametrize(
+    "path, get, query, body, content_type, override",
+    _OVERRIDE_ROWS,
+    ids=[
+        "files-list",
+        "about",
+        "files-get",
+        "drives",
+        "gmail-labels",
+        "gmail-head",
+        "docs",
+        "sheets",
+        "sheets-tab-get",
+        "lower-case-get",
+        "spaced-get",
+        "head",
+        "mixed-case-head",
+        "no-content-type",
+        "form-with-charset",
+        "form-in-capitals",
+        "form-after-another-type",
+        "form-less-a-letter",
+        "text-plain",
+        "json",
+        "url-query-first",
+    ],
+)
+def test_google_read_sent_as_a_post_with_a_get_override_is_the_get(
+    client, admin_h, path, get, query, body, content_type, override
+):
+    """Each row is how `answer_a_google_read_sent_as_a_post` reads its POST: as the GET of the
+    query in the second column."""
+    files = client.get("/drive/v3/files", headers=admin_h, params={"pageSize": "100"}).json()
+    sheet = next(f["id"] for f in files["files"] if f["mimeType"].endswith("spreadsheet"))
+    doc = next(f["id"] for f in files["files"] if f["mimeType"].endswith("document"))
+    url = path.format(file=files["files"][0]["id"], sheet=sheet, doc=doc)
+    headers = {**admin_h, "X-HTTP-Method-Override": override}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    got = client.get(f"{url}?{get}", headers=admin_h)
+    posted = client.post(f"{url}?{query}", headers=headers, content=body)
+    assert (posted.status_code, posted.content) == (got.status_code, got.content)
+
+
+@pytest.mark.parametrize(
+    "method, path, overrides",
+    [
+        ("POST", "/drive/v3/about", []),
+        ("POST", "/drive/v3/about", ["PUT"]),
+        ("POST", "/drive/v3/about", ["GET, PUT"]),
+        ("POST", "/drive/v3/about", ["GET", "GET"]),
+        ("POST", "/drive/v3/about", ["NBSPGET"]),
+        ("POST", "/drive/v3/about", ["NELGET"]),
+        ("POST", "/gmail/v1/users/me/labels", ["get"]),
+        ("POST", "/gmail/v1/users/me/labels", ["Head"]),
+        ("POST", "/docs/v1/documents/{doc}", ["HEAD"]),
+        ("POST", "/docs/v1/documents/{doc}", ["get"]),
+        ("POST", "/sheets/v4/spreadsheets/{sheet}", ["HEAD"]),
+        ("POST", "/sheets/v4/spreadsheets/{sheet}", ["Get"]),
+        ("PUT", "/drive/v3/about", ["GET"]),
+        ("DELETE", "/drive/v3/about", ["GET"]),
+    ],
+    ids=[
+        "none",
+        "put",
+        "get-and-put",
+        "get-twice",
+        "nbsp-get",
+        "nel-get",
+        "gmail-lower-case-get",
+        "gmail-mixed-case-head",
+        "docs-head",
+        "docs-lower-case-get",
+        "sheets-head",
+        "sheets-mixed-case-get",
+        "drive-put",
+        "drive-delete",
+    ],
+)
+def test_google_request_whose_override_is_not_read_goes_on_as_sent(
+    client, admin_h, method, path, overrides
+):
+    """A request whose `X-HTTP-Method-Override` :data:`backlot.main._GOOGLE_READ_OVERRIDES` does not
+    read for its path, or that is not a POST, is answered as the same request with no override is.
+    The headers go out as their latin-1 bytes (`sent_as`), so `NBSP` and `NEL` stand for 0xA0 and
+    0x85."""
+    files = client.get("/drive/v3/files", headers=admin_h, params={"pageSize": "100"}).json()
+    sheet = next(f["id"] for f in files["files"] if f["mimeType"].endswith("spreadsheet"))
+    doc = next(f["id"] for f in files["files"] if f["mimeType"].endswith("document"))
+    url = path.format(sheet=sheet, doc=doc)
+    plain = [*admin_h.items(), ("Content-Type", _FORM)]
+    named = [
+        *plain,
+        *(
+            ("X-HTTP-Method-Override", o.replace("NBSP", chr(0xA0)).replace("NEL", chr(0x85)))
+            for o in overrides
+        ),
+    ]
+    posted = sent_as(client, method, url, named, content=b"fields=kind")
+    control = sent_as(client, method, url, plain, content=b"fields=kind")
+    assert (posted.status_code, posted.content) == (control.status_code, control.content)
